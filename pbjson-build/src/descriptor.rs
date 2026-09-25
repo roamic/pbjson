@@ -2,6 +2,7 @@
 //! format for use by the rest of the codebase
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::collections::btree_map::Entry;
 use std::fmt::{Display, Formatter};
 use std::io::{Error, ErrorKind, Result};
@@ -158,6 +159,8 @@ impl TypePath {
 #[derive(Debug, Clone, Default)]
 pub struct DescriptorSet {
     descriptors: BTreeMap<TypePath, Descriptor>,
+    file_types: BTreeMap<String, Vec<TypePath>>,
+    file_dependencies: BTreeMap<String, Vec<String>>,
 }
 
 impl DescriptorSet {
@@ -182,12 +185,18 @@ impl DescriptorSet {
         let package = Package::new(file.package.expect("expected package"));
         let path = TypePath::new(package);
 
+        let mut type_paths = Vec::new();
         for descriptor in file.message_type {
-            self.register_message(&path, descriptor, syntax)
+            type_paths.extend(self.register_message(&path, descriptor, syntax))
         }
 
         for descriptor in file.enum_type {
-            self.register_enum(&path, descriptor)
+            type_paths.push(self.register_enum(&path, descriptor))
+        }
+
+        if let Some(name) = file.name {
+            self.file_types.insert(name.clone(), type_paths);
+            self.file_dependencies.insert(name, file.dependency);
         }
     }
 
@@ -195,38 +204,69 @@ impl DescriptorSet {
         self.descriptors.iter()
     }
 
-    fn register_message(&mut self, path: &TypePath, descriptor: DescriptorProto, syntax: Syntax) {
+    /// Returns the type paths defined in files imported by another registered file
+    ///
+    /// A file is considered imported if it appears in the dependency list of
+    /// any other registered file, including transitive imports
+    pub fn imported_type_paths(&self) -> HashSet<&TypePath> {
+        let mut imported_files: HashSet<&str> = HashSet::new();
+        for dependencies in self.file_dependencies.values() {
+            imported_files.extend(dependencies.iter().map(String::as_str));
+        }
+
+        let mut imported_types: HashSet<&TypePath> = HashSet::new();
+        for file in imported_files {
+            if let Some(type_paths) = self.file_types.get(file) {
+                imported_types.extend(type_paths);
+            }
+        }
+        imported_types
+    }
+
+    fn register_message(
+        &mut self,
+        path: &TypePath,
+        descriptor: DescriptorProto,
+        syntax: Syntax,
+    ) -> Vec<TypePath> {
         let name = TypeName::new(descriptor.name.expect("expected name"));
         let child_path = path.child(name);
 
+        let mut type_paths = Vec::new();
+
         for child_descriptor in descriptor.enum_type {
-            self.register_enum(&child_path, child_descriptor)
+            type_paths.push(self.register_enum(&child_path, child_descriptor))
         }
 
         for child_descriptor in descriptor.nested_type {
-            self.register_message(&child_path, child_descriptor, syntax)
+            type_paths.extend(self.register_message(&child_path, child_descriptor, syntax))
         }
 
         self.register_descriptor(
             child_path.clone(),
             Descriptor::Message(MessageDescriptor {
-                path: child_path,
+                path: child_path.clone(),
                 options: descriptor.options,
                 one_of: descriptor.oneof_decl,
                 fields: descriptor.field,
                 syntax,
             }),
         );
+
+        type_paths.push(child_path);
+        type_paths
     }
 
-    fn register_enum(&mut self, path: &TypePath, descriptor: EnumDescriptorProto) {
+    fn register_enum(&mut self, path: &TypePath, descriptor: EnumDescriptorProto) -> TypePath {
         let name = TypeName::new(descriptor.name.expect("expected name"));
+        let path = path.child(name);
         self.register_descriptor(
-            path.child(name),
+            path.clone(),
             Descriptor::Enum(EnumDescriptor {
                 values: descriptor.value,
             }),
         );
+        path
     }
 
     fn register_descriptor(&mut self, path: TypePath, descriptor: Descriptor) {
@@ -276,6 +316,53 @@ impl MessageDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost_types::{DescriptorProto, FileDescriptorProto};
+
+    #[test]
+    fn test_imported_type_paths() {
+        fn file(name: &str, package: &str, dependencies: &[&str]) -> FileDescriptorProto {
+            FileDescriptorProto {
+                name: Some(name.to_string()),
+                package: Some(package.to_string()),
+                dependency: dependencies.iter().map(|d| d.to_string()).collect(),
+                message_type: vec![DescriptorProto {
+                    name: Some("Message".to_string()),
+                    nested_type: vec![DescriptorProto {
+                        name: Some("Nested".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        }
+
+        let mut descriptors = DescriptorSet::default();
+        descriptors.register_file_descriptor(file(
+            "root.proto",
+            "root",
+            &["direct.proto", "transitive.proto"],
+        ));
+        descriptors.register_file_descriptor(file("direct.proto", "direct", &[]));
+        descriptors.register_file_descriptor(file(
+            "transitive.proto",
+            "transitive",
+            &["direct.proto"],
+        ));
+        descriptors.register_file_descriptor(file("independent.proto", "independent", &[]));
+
+        fn message_path(package: &str) -> TypePath {
+            TypePath::new(Package::new(package)).child(TypeName::new("Message"))
+        }
+
+        let imported = descriptors.imported_type_paths();
+        assert!(!imported.contains(&message_path("root")));
+        assert!(imported.contains(&message_path("direct")));
+        assert!(imported.contains(&message_path("direct").child(TypeName::new("Nested"))));
+        assert!(imported.contains(&message_path("transitive")));
+        assert!(!imported.contains(&message_path("independent")));
+    }
+
     #[test]
     fn test_prefix_match() {
         let t = TypePath::new(Package::new("foo.bar"))

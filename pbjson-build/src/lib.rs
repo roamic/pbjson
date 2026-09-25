@@ -100,6 +100,7 @@ mod resolver;
 pub struct Builder {
     descriptors: descriptor::DescriptorSet,
     exclude: Vec<String>,
+    exclude_imports: bool,
     out_dir: Option<PathBuf>,
     extern_paths: Vec<(String, String)>,
     retain_enum_prefix: bool,
@@ -147,6 +148,20 @@ impl Builder {
         prefixes: I,
     ) -> &mut Self {
         self.exclude.extend(prefixes.into_iter().map(Into::into));
+        self
+    }
+
+    /// Don't generate code for types defined in files imported by any other
+    /// registered file, even if they match one of the `prefixes` passed to
+    /// [`Builder::build`]
+    ///
+    /// A `FileDescriptorSet` produced by `protoc` contains not just the
+    /// compiled files but also their transitive imports. Use this option to
+    /// only generate code for the types defined in the remaining files, e.g.
+    /// `.build(&["."])` combined with this option generates code for all
+    /// non-imported types
+    pub fn exclude_imports(&mut self) -> &mut Self {
+        self.exclude_imports = true;
         self
     }
 
@@ -247,7 +262,17 @@ impl Builder {
         prefixes: &[S],
         mut write_factory: F,
     ) -> Result<Vec<(Package, W)>> {
+        let imported_types = self
+            .exclude_imports
+            .then(|| self.descriptors.imported_type_paths());
+
         let iter = self.descriptors.iter().filter(move |(t, _)| {
+            if imported_types
+                .as_ref()
+                .is_some_and(|imported_types| imported_types.contains(*t))
+            {
+                return false;
+            }
             let exclude = self
                 .exclude
                 .iter()
@@ -302,5 +327,67 @@ impl Builder {
         }
 
         Ok(ret)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost_types::{DescriptorProto, FileDescriptorProto};
+
+    fn file(
+        name: &str,
+        package: &str,
+        dependencies: &[&str],
+        messages: &[&str],
+    ) -> FileDescriptorProto {
+        FileDescriptorProto {
+            name: Some(name.to_string()),
+            package: Some(package.to_string()),
+            dependency: dependencies.iter().map(|d| d.to_string()).collect(),
+            message_type: messages
+                .iter()
+                .map(|m| DescriptorProto {
+                    name: Some(m.to_string()),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn generate_skips_imported_types() {
+        let mut builder = Builder::new();
+        builder
+            .register_file_descriptor(file("root.proto", "root", &["dep.proto"], &["Root"]))
+            .register_file_descriptor(file("dep.proto", "dep", &[], &["Imported"]));
+
+        let writers = builder.generate(&["."], |_| Ok(Vec::<u8>::new())).unwrap();
+        assert_eq!(writers.len(), 2);
+        let dep_output = String::from_utf8(
+            writers
+                .iter()
+                .find(|(p, _)| *p == Package::new("dep"))
+                .as_ref()
+                .unwrap()
+                .1
+                .clone(),
+        )
+        .unwrap();
+        assert!(dep_output.contains("impl serde::Serialize for Imported"));
+
+        let mut builder = Builder::new();
+        builder
+            .register_file_descriptor(file("root.proto", "root", &["dep.proto"], &["Root"]))
+            .register_file_descriptor(file("dep.proto", "dep", &[], &["Imported"]))
+            .exclude_imports();
+
+        let writers = builder.generate(&["."], |_| Ok(Vec::<u8>::new())).unwrap();
+        assert_eq!(writers.len(), 1);
+        assert_eq!(writers[0].0, Package::new("root"));
+        let output = String::from_utf8(writers[0].1.clone()).unwrap();
+        assert!(output.contains("impl serde::Serialize for Root"));
+        assert!(!output.contains("Imported"));
     }
 }
