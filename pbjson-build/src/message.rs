@@ -74,6 +74,7 @@ impl FieldModifier {
 pub struct Field {
     pub name: String,
     pub json_name: Option<String>,
+    pub lowercase_name: Option<String>,
     pub field_modifier: FieldModifier,
     pub field_type: FieldType,
 }
@@ -94,6 +95,13 @@ impl Field {
         self.json_name
             .clone()
             .unwrap_or_else(|| self.name.to_lower_camel_case())
+    }
+
+    pub fn lowercase_name(&self) -> String {
+        use heck::ToLowerCamelCase;
+        self.lowercase_name
+            .clone()
+            .unwrap_or_else(|| self.name.to_lower_camel_case().to_lowercase())
     }
 }
 
@@ -147,6 +155,10 @@ pub fn resolve_message(
         let resolved = Field {
             name: field.name.clone().expect("expected field to have name"),
             json_name: field.json_name.clone(),
+            lowercase_name: field
+                .json_name
+                .as_ref()
+                .and_then(|name| Some(name.to_lowercase())),
             field_type,
             field_modifier,
         };

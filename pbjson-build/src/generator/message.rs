@@ -39,6 +39,7 @@ pub fn generate_message<W: Write>(
     message: &Message,
     writer: &mut W,
     ignore_unknown_fields: bool,
+    ignore_case: bool,
     btree_map_paths: &[String],
     emit_fields: bool,
     preserve_proto_field_names: bool,
@@ -66,6 +67,7 @@ pub fn generate_message<W: Write>(
         &rust_type,
         writer,
         ignore_unknown_fields,
+        ignore_case,
         btree_map_paths,
     )?;
     write_deserialize_end(0, writer)?;
@@ -513,9 +515,10 @@ fn write_deserialize_message<W: Write>(
     rust_type: &str,
     writer: &mut W,
     ignore_unknown_fields: bool,
+    ignore_case: bool,
     btree_map_paths: &[String],
 ) -> Result<()> {
-    write_deserialize_field_name(2, message, writer, ignore_unknown_fields)?;
+    write_deserialize_field_name(2, message, writer, ignore_unknown_fields, ignore_case)?;
 
     writeln!(writer, "{}struct GeneratedVisitor;", Indent(indent))?;
 
@@ -671,29 +674,31 @@ fn write_deserialize_field_name<W: Write>(
     message: &Message,
     writer: &mut W,
     ignore_unknown_fields: bool,
+    ignore_case: bool,
 ) -> Result<()> {
     let fields: Vec<_> = message
         .all_fields()
         .map(|field| {
             let json_name = field.json_name();
+            let lowercase_name = field.lowercase_name();
             // only carry the original proto name if it's different from the provided json name
             let proto_name =
                 Some(field.name.as_str()).filter(|proto_name| proto_name != &json_name);
-            (json_name, field.rust_type_name(), proto_name)
+            (json_name, lowercase_name, field.rust_type_name(), proto_name)
         })
         .collect();
 
     write_fields_array(
         writer,
         indent,
-        fields.iter().flat_map(|(json_name, _, proto_name)| {
+        fields.iter().flat_map(|(json_name, _, _, proto_name)| {
             proto_name.iter().copied().chain([json_name.as_str()])
         }),
     )?;
     write_fields_enum(
         writer,
         indent,
-        fields.iter().map(|(_, type_name, _)| type_name.as_str()),
+        fields.iter().map(|(_, _, type_name, _)| type_name.as_str()),
         ignore_unknown_fields,
     )?;
 
@@ -722,14 +727,19 @@ fn write_deserialize_field_name<W: Write>(
     )?;
 
     if !fields.is_empty() {
-        writeln!(writer, "{}match value {{", Indent(indent + 4))?;
-        for (json_name, type_name, proto_name) in &fields {
+        if ignore_case {
+            writeln!(writer, "{}let value = value.to_lowercase();", Indent(indent + 4))?;
+            writeln!(writer, "{}match value.as_str() {{", Indent(indent + 4))?;
+        } else {
+            writeln!(writer, "{}match value {{", Indent(indent + 4))?;
+        }
+        for (json_name, lowercase_name, type_name, proto_name) in &fields {
             if let Some(proto_name) = proto_name {
                 writeln!(
                     writer,
                     "{}\"{}\" | \"{}\" => Ok(GeneratedField::{}),",
                     Indent(indent + 5),
-                    json_name,
+                    if ignore_case { lowercase_name } else { json_name },
                     proto_name,
                     escape_type(type_name.to_string())
                 )?;
@@ -738,7 +748,7 @@ fn write_deserialize_field_name<W: Write>(
                     writer,
                     "{}\"{}\" => Ok(GeneratedField::{}),",
                     Indent(indent + 5),
-                    json_name,
+                    if ignore_case { lowercase_name } else { json_name },
                     escape_type(type_name.to_string())
                 )?;
             }

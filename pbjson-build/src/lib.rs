@@ -105,6 +105,7 @@ pub struct Builder {
     extern_paths: Vec<(String, String)>,
     retain_enum_prefix: bool,
     ignore_unknown_fields: bool,
+    ignore_case: bool,
     btree_map_paths: Vec<String>,
     emit_fields: bool,
     use_integers_for_enums: bool,
@@ -186,6 +187,13 @@ impl Builder {
     /// instead skip the field.
     pub fn ignore_unknown_fields(&mut self) -> &mut Self {
         self.ignore_unknown_fields = true;
+
+        self
+    }
+
+    /// When looking for a field, ignore the case of the json name
+    pub fn ignore_case(&mut self) -> &mut Self {
+        self.ignore_case = true;
 
         self
     }
@@ -317,6 +325,7 @@ impl Builder {
                             &message,
                             writer,
                             self.ignore_unknown_fields,
+                            self.ignore_case,
                             &self.btree_map_paths,
                             self.emit_fields,
                             self.preserve_proto_field_names,
